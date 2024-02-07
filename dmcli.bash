@@ -27,7 +27,7 @@ function Help()
 	echo "	-a			Add a new disk."
 	echo "	-c			List generic information"
 	echo "	-d disk			Delete a disk."
-	echo "	-l disk			List information about a disk."
+	echo "	-l disk			List information about a local partition."
 	echo
 }
 
@@ -227,21 +227,21 @@ function ListDisk()
 	local lun_id="$1"
 
 	# Check if disk exists
-	DISKEXISTS=$(fdisk -l | grep -e /dev/$lun_id -e /dev/mapper/$lun_id| wc -l)
-	if [ $DISKEXISTS = 0 ]
+	# DISKEXISTS=$(fdisk -l | grep -e /dev/$lun_id -e /dev/mapper/$lun_id | wc -l)
+	# if [ $DISKEXISTS = 0 ]
+	# then
+	# 	echo -e "Disk $lun_id does not exist. Exiting."
+	# 	exit 0
+	# else
+	if [[ $lun_id = s* ]]
 	then
-		echo -e "Disk $lun_id does not exist. Exiting."
-		exit 0
-	else
-		if [[ $lun_id = s* ]]
-		then
-			ShowVolumeAttr $lun_id
-		elif [[ $lun_id = m* ]]
-		then
-			ShowVolumeAttr $lun_id
-			ShowSANAttr $lun_id
-		fi
+		ShowVolumeAttr $lun_id
+	elif [[ $lun_id = m* ]]
+	then
+		ShowVolumeAttr $lun_id
+		ShowSANAttr $lun_id
 	fi
+	# fi
 }
 
 ############################################################
@@ -251,43 +251,56 @@ function ShowVolumeAttr()
 {
 	local lun_id="$1"
 
-	if [[ $lun_id = s* ]]
+	# Test if lun/disk exists and is in correct format.
+	if [[ $lun_id = s* && $(partprobe -d -s /dev/$lun_id) ]]
 	then
-		lun_id="/dev/$lun_id"
-	elif [[ $lun_id = m* ]]
+		#lun_id="/dev/$lun_id?"
+		lun_id=$(fdisk -l /dev/$lun_id | grep $lun_id  | tail -n +2 | awk '$2 != "*"' | awk '{print $1}')
+		PV=$(pvs $lun_id 2> /dev/null | awk '{print $1}' | tail -n +2)
+
+		# Test existence
+		if [[ -z $PV ]]
+		then
+			echo -e "Partition $lun_id exists but there are no physical volumes found!"
+			exit 0
+		fi
+	elif [[ $lun_id = m* && $(multipath -ll $lun_id) ]]
 	then
 		lun_id="/dev/mapper/$lun_id"
+		PV=$(pvs $lun_id? | awk '{print $1}' | tail -n +2)
+	else
+		echo -e "Disk $lun_id not found or is a partition device."
+		exit 1
 	fi
-	# Show info on PV, VG, and LV
-	PV=$(pvs $lun_id | awk '{print $1}' | tail -n +2)
-	VG=$(pvs $lun_id | awk '{print $2}' | tail -n +2)
-	declare -a LV
 
 	# Create array for Logical Volumes
-	for pv in $PV
-	do
-		LV[${#LV[@]}]+=$(pvdisplay -m $pv | grep "Logical volume" | awk '{print $3}')
-	done
-	#echo -e "Physical Volume(s)\tVolume Group\tLogical Volume(s)"
-	#echo -e "------------------\t------------\t-----------------"
-	#paste <(printf %s "$PV") <(printf "%s" "$VG") <(printf "\t%s" "${LV[@]}")
+	declare -a LV
 
 	# Stack Overflow Addition https://stackoverflow.com/questions/77928800/column-format-separation-using-paste-and-an-array
-
-	for lv in "${!LV[@]}"
+	for pv in $PV
 	do
-		printf "%s\t%s\t%s\t%s\n" "Physical Volume(s)" "Volume Group" "Logical Volume(s)" "LV Size"
-		printf "%s\t%s\t%s\t%s\n" "------------------" "------------" "-----------------" "-------"
-		if [ "$lv" -ne 0 ]
-		then
-			printf "No physical volumes"
-		fi
-		PHYSV=$(lvs --segments ${LV[$lv]} -o +lv_size,devices | tail -n +2 | grep $lun_id | awk '{print $8}' | sed "s/([^)]*)/()/g" | tr -d '()')
-		VOLG=$(lvs --segments ${LV[$lv]} -o +lv_size,devices | tail -n +2 | grep $lun_id | awk '{print $2}')
-		LVSIZE=$(pvs $lun_id -o+lv_size,lv_path,seg_size | tail -n +2 | grep  ${LV[$lv]}  | awk '{print $9}')
-		#printf "%s\t%s\t%s\t\n" $PHYSV "$VOLG" "${LV[$lv]}"
-		paste <(printf "%s" "$PHYSV") <(printf "%s" "$VOLG") <(printf "%s" "${LV[$lv]}") <(printf "%s" "$LVSIZE")
-	done | column -ts $'\t'
+		# Add Logical Volumes for $pv into the array
+		LV[${#LV[@]}]+=$(pvdisplay -m $pv | grep "Logical volume" | awk '{print $3}')
+		echo -e "\n"
+		# Loop through array and display contents
+		for lv in "${!LV[@]}"
+		do 
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "Physical Volume(s)" "Volume Group" "Logical Volume(s)" "LV Size" "Mount Point" "FS Size" "FS Type"
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "------------------" "------------" "-----------------" "-------" "-----------" "-------" "-------"
+
+			PHYSV=$(lvs --segments ${LV[$lv]} -o+lv_size,devices | tail -n +2 | grep $pv | awk '{print $8}' | sed "s/([^)]*)/()/g" | tr -d '()')
+			FSSIZE=$(lsblk -l ${LV[$lv]} | tail -n +2 | awk '{print $4}')
+			MOUNTPOINT=$(lsblk -l ${LV[$lv]} | tail -n +2 | awk '{print $7}')
+			FSTYPE=$(lsblk -lf ${LV[$lv]} | tail -n +2 | awk '{print $2}')
+			PHYSVOL=$(lvs --segments ${LV[$lv]} -o+lv_size,devices | tail -n +2 | grep $pv | awk '{print $6}')
+			VOLGRP=$(lvs --segments ${LV[$lv]} -o+lv_size,devices | tail -n +2 | grep $pv | awk '{print $2}')
+
+			paste <(printf "%s" "$PHYSV") <(printf "%s" "$VOLGRP") <(printf "%s" "${LV[$lv]}") <(printf "%s" "$PHYSVOL") <(printf "%s" "$MOUNTPOINT") <(printf "%s" "$FSSIZE") <(printf "%s" "$FSTYPE")
+		done | column -ts $'\t'
+
+		# Clear array
+		LV=()
+	done
 }
 
 ############################################################
@@ -320,7 +333,7 @@ function ShowSANAttr()
 	done
 
 	paste <(printf %s "$HOSTPATH") <(printf %s "$BACKINGDEVICE") <(printf "%s\n" "${PRETTYADAPTERPATH[@]}")
-}
+} 
 ############################################################
 # List generic information                                 #
 ############################################################
